@@ -72,16 +72,20 @@ class TableWriter : public IBlockOutputStream {
     }
 
     void write(const Block& block) override {
+        Logger* logger = Logger::get("TableWriter");
+
         storage->check(block, true);
         std::lock_guard lock(storage->mutex);
 
         Columns pk_cols;
         for (const auto& pk_col_name : storage->getPrimaryKeyColumns()) {
+            LOG_INFO(logger, "Primary key column: {}", pk_col_name);
             pk_cols.push_back(block.getByName(pk_col_name).column);
         }
 
         Columns cols;
         for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+            LOG_INFO(logger, "Column: {}", col_name_type.name);
             cols.push_back(block.getByName(col_name_type.name).column);
         }
 
@@ -102,6 +106,13 @@ class TableWriter : public IBlockOutputStream {
   private:
     StorageHTAP* storage;
 };
+
+StorageHTAP::StorageHTAP(const DB::StorageID& table_id,
+                         DB::ColumnsDescription columns_description,
+                         DB::ConstraintsDescription constraints) : IStorage(table_id) {
+    setColumns(std::move(columns_description));
+    setConstraints(constraints);
+}
 
 Pipes StorageHTAP::read(const Names& column_names,
                         const SelectQueryInfo&,
@@ -141,6 +152,12 @@ void StorageHTAP::truncate(const ASTPtr&,
 std::optional<UInt64> StorageHTAP::totalRows() const {
     std::lock_guard lock(mutex);
     return table.size();
+}
+
+void registerStorageHTAP(StorageFactory& factory) {
+    factory.registerStorage("HTAP", [](const StorageFactory::Arguments& args) {
+        return StorageHTAP::create(args.table_id, args.columns, args.constraints);
+    })
 }
 
 }

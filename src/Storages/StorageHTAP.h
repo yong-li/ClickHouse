@@ -15,6 +15,10 @@ using Table = std::map<Tuple, Tuple>;
 
 class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public IStorage {
   public:
+    StorageHTAP(const StorageID& table_id,
+                ColumnsDescription columns_description,
+                ConstraintsDescription constraints);
+
     String getName() const override { return "HTAP"; }
 
     Pipes read(
@@ -37,6 +41,7 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
     mutable std::mutex mutex;
 
     Table table;
+
 };
 
 }
