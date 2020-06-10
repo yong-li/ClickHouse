@@ -5,7 +5,9 @@
 
 #include <ext/shared_ptr_helper.h>
 
+#include <Storages/StorageFactory.h>
 #include <Storages/IStorage.h>
+#include <Storages/StorageMergeTree.h>
 
 
 namespace DB
@@ -15,9 +17,7 @@ using Table = std::map<Tuple, Tuple>;
 
 class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public IStorage {
   public:
-    StorageHTAP(const StorageID& table_id,
-                ColumnsDescription columns_description,
-                ConstraintsDescription constraints);
+    StorageHTAP(const StorageFactory::Arguments& args);
 
     String getName() const override { return "HTAP"; }
 
@@ -31,6 +31,12 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
 
     BlockOutputStreamPtr write(const ASTPtr& query, const Context& context) override;
 
+    bool optimize(const ASTPtr& query,
+                  const ASTPtr& partition,
+                  bool final,
+                  bool deduplicate,
+                  const Context& context) override;
+
     void drop() override;
 
     void truncate(const ASTPtr&, const Context&, TableStructureWriteLockHolder&) override;
@@ -42,6 +48,7 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
 
     Table table;
 
+    std::shared_ptr<StorageMergeTree> base_storage;
 };
 
 }
