@@ -48,7 +48,9 @@ class StorageHTAP final : public ext::shared_ptr_helper<StorageHTAP>, public ISt
 
     Table table;
 
-    std::shared_ptr<StorageMergeTree> base_storage;
+    std::shared_ptr<IStorage> base_storage;
+
+    uint64_t table_size;
 };
 
 }

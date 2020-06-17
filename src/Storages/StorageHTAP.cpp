@@ -2,12 +2,14 @@
 
 #include <DataStreams/IBlockOutputStream.h>
 
+#include <Interpreters/Context.h>
+
 #include <Parsers/ASTCreateQuery.h>
 
 #include <Storages/StorageHTAP.h>
 #include <Storages/StorageFactory.h>
 
-#include <Processors/Sources/SourceWithProgress.h>
+#include <Processors/ISimpleTransform.h>
 #include <Processors/Pipe.h>
 
 namespace DB {
@@ -16,19 +18,109 @@ namespace ErrorCodes {
 extern const int STORAGE_REQUIRES_PARAMETER;
 }
 
-class TableReader : public SourceWithProgress {
-  public:
-    TableReader(const Names& column_names_, Table::iterator begin_, Table::iterator end_,
-                StorageHTAP* storage_)
-        : SourceWithProgress{storage_->getSampleBlockForColumns(column_names_)},
-          column_names{column_names_}, begin{begin_}, end{end_}, storage(storage_) {}
+static Block createOutputHeader(Block header, const Names& column_names) {
+    Block output_header;
+    for (const auto& col_name : column_names) {
+        output_header.insert(header.getByName(col_name).cloneEmpty());
+    }
+    return output_header;
+}
 
-    String getName() const override { return "Table"; }
+class TableReader : public ISimpleTransform {
+  public:
+    TableReader(const Block& header_,
+                const Names& column_names_,
+                int* active_reader_count_,
+                StorageHTAP* storage_)
+        : ISimpleTransform(header_, createOutputHeader(header_, column_names_), false),
+          column_names{column_names_}, active_reader_count{active_reader_count_},
+          storage{storage_} {}
+
+    String getName() const override { return "TableReader"; }
+
+    Status prepare() override {
+        Logger* logger = &Logger::get("TableReader");
+
+        LOG_INFO(logger,
+                 "Prepare reading HTAP table '{}'.",
+                 storage->getStorageID().getFullTableName());
+
+        /// Check can output.
+
+        if (output.isFinished()) {
+            input.close();
+            return Status::Finished;
+        }
+
+        if (!output.canPush()) {
+            input.setNotNeeded();
+            return Status::PortFull;
+        }
+
+        /// Output if has data.
+        if (has_output) {
+            output.pushData(std::move(output_data));
+            has_output = false;
+
+            if (!no_more_data_needed)
+                return Status::PortFull;
+
+        }
+
+        /// Stop if don't need more data.
+        if (no_more_data_needed) {
+            input.close();
+            output.finish();
+            return Status::Finished;
+        }
+
+        /// Check can input.
+        if (!has_input) {
+            if (input.isFinished()) {
+                std::lock_guard lock(storage->mutex);
+                (*active_reader_count)--;
+                if (*active_reader_count == 0) {
+                    // Last reader.  Now return table rows.
+                    LOG_INFO(logger,
+                             "Reading HTAP table '{}'. Last source pipe finished.",
+                             storage->getStorageID().getFullTableName());
+                    input_data.chunk = {};
+                    input_data.exception = nullptr;
+                    return Status::Ready;
+                } else {
+                    LOG_INFO(logger,
+                             "Reading HTAP table '{}'. One source pipe finished. Remaining pipes: {}",
+                             storage->getStorageID().getFullTableName(),
+                             *active_reader_count);
+                    output.finish();
+                    return Status::Finished;
+                }
+            }
+
+            input.setNeeded();
+
+            if (!input.hasData())
+                return Status::NeedData;
+
+            input_data = input.pullData(set_input_not_needed_after_read);
+            has_input = true;
+
+            if (input_data.exception)
+                /// No more data needed. Exception will be thrown (or swallowed) later.
+                input.setNotNeeded();
+        }
+
+        /// Now transform.
+        return Status::Ready;
+    }
 
   protected:
-    Chunk generate() override {
-        if (begin == end)
-            return {};
+    void transform(Chunk& chunk) override {
+        Logger* logger = &Logger::get("TableReader");
+
+        LOG_INFO(logger,
+                 "Reading HTAP table '{}'.",
+                 storage->getStorageID().getFullTableName());
 
         std::lock_guard lock(storage->mutex);
 
@@ -38,6 +130,7 @@ class TableReader : public SourceWithProgress {
         column_positions.reserve(column_names.size());
 
         for (const std::string& col_name : column_names) {
+            LOG_INFO(logger, "Read include column '{}'.", col_name);
             uint32_t pos = 0;
             for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
                 if (col_name == col_name_type.name) {
@@ -50,28 +143,73 @@ class TableReader : public SourceWithProgress {
         }
 
         uint32_t row_count = 0;
-        while (begin != end) {
-            const Tuple& row = begin->second;
-            for (size_t i = 0; i < columns.size(); i++) {
-                columns[i]->insert(row[column_positions[i]]);
+        if (!has_input) {
+            LOG_INFO(logger,
+                     "Reading in-mem rows of HTAP table '{}' .",
+                     storage->getStorageID().getFullTableName());
+
+            for (const auto& row_pair : storage->table) {
+                if (returned_keys.find(row_pair.first) == returned_keys.end()) {
+                    const Tuple& row = row_pair.second;
+                    for (size_t i = 0; i < columns.size(); i++) {
+                        columns[i]->insert(row[column_positions[i]]);
+                    }
+                    row_count++;
+                }
             }
-            row_count++;
-            begin++;
+        } else {
+            LOG_INFO(logger,
+                     "Reading MergeTree rows of HTAP table '{}' .",
+                     storage->getStorageID().getFullTableName());
+
+            Block raw_data =
+                getInputPort().getHeader().cloneWithColumns(chunk.detachColumns());
+
+            Columns pk_cols;
+            for (const auto& pk_col_name : storage->getPrimaryKeyColumns()) {
+                LOG_INFO(logger, "Primary key column: '{}'.", pk_col_name);
+                pk_cols.push_back(raw_data.getByName(pk_col_name).column);
+            }
+
+            for (size_t i = 0; i < raw_data.rows(); i++) {
+                Tuple key;
+                for (auto& pk_c : pk_cols) {
+                    key.push_back((*pk_c)[i]);
+                }
+
+                if (returned_keys.find(key) == returned_keys.end()) {
+                    auto row_pair = storage->table.find(key);
+                    if (row_pair == storage->table.end()) {
+                        for (size_t j = 0; j < columns.size(); j++) {
+                            ColumnPtr col = raw_data.getByName(column_names[j]).column;
+                            columns[j]->insert((*col)[i]);
+                        }
+                    } else {
+                        const Tuple& row = row_pair->second;
+                        for (size_t j = 0; j < columns.size(); j++) {
+                            columns[j]->insert(row[column_positions[j]]);
+                        }
+                    }
+                    row_count++;
+                    returned_keys.insert(key);
+                }
+            }
         }
 
-        return Chunk(std::move(columns), row_count);
+        chunk.setColumns(std::move(columns), row_count);
     }
 
   private:
     Names column_names;
-    Table::iterator begin;
-    Table::iterator end;
+    int* active_reader_count;
     StorageHTAP* storage;
+    std::set<Tuple> returned_keys;
 };
 
 class TableWriter : public IBlockOutputStream {
   public:
-    explicit TableWriter(StorageHTAP* storage_) : storage{storage_} {}
+    explicit TableWriter(StorageHTAP* storage_, const Context& context_)
+        : storage{storage_}, context{context_} {}
 
     Block getHeader() const override {
         return storage->getSampleBlock();
@@ -80,20 +218,22 @@ class TableWriter : public IBlockOutputStream {
     void write(const Block& block) override {
         Logger* logger = &Logger::get("TableWriter");
 
-        LOG_INFO(logger, "Writing HTAP table.");
+        LOG_INFO(logger,
+                 "Writing HTAP table '{}'.",
+                 storage->getStorageID().getFullTableName());
 
         storage->check(block, true);
         std::lock_guard lock(storage->mutex);
 
         Columns pk_cols;
         for (const auto& pk_col_name : storage->getPrimaryKeyColumns()) {
-            LOG_INFO(logger, "Primary key column: {}", pk_col_name);
+            LOG_INFO(logger, "Primary key column: '{}'.", pk_col_name);
             pk_cols.push_back(block.getByName(pk_col_name).column);
         }
 
         Columns cols;
         for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
-            LOG_INFO(logger, "Column: {}", col_name_type.name);
+            LOG_INFO(logger, "Column: '{}'.", col_name_type.name);
             cols.push_back(block.getByName(col_name_type.name).column);
         }
 
@@ -109,18 +249,55 @@ class TableWriter : public IBlockOutputStream {
             storage->table.insert_or_assign(key, row);
         }
 
+        if ((++storage->table_size) % 2 == 0) {
+            LOG_INFO(logger,
+                     "Merging HTAP table '{}' with base storage.",
+                     storage->getStorageID().getFullTableName());
+
+            MutableColumns data_columns;
+            for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+                data_columns.push_back(col_name_type.type->createColumn());
+            }
+            for (const auto& row_pair : storage->table) {
+                const Tuple& row = row_pair.second;
+                for (size_t i = 0; i < data_columns.size(); i++) {
+                    data_columns[i]->insert(row[i]);
+                }
+            }
+
+            Block batch_data = storage->getSampleBlock();
+            batch_data.setColumns(std::move(data_columns));
+
+            storage->base_storage->write(nullptr, context)->write(batch_data);
+            storage->base_storage->optimize(nullptr, nullptr, true, false, context);
+
+            LOG_INFO(logger,
+                     "HTAP table '{}' merged with base storage.",
+                     storage->getStorageID().getFullTableName());
+
+            storage->table.clear();
+        }
     }
 
   private:
     StorageHTAP* storage;
+    const Context& context;
 };
 
 StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
     : IStorage(args.table_id) {
     Logger* logger = &Logger::get("StorageHTAP");
 
+    if (args.storage_def->primary_key == nullptr) {
+        throw Exception("Primary key must be defined for HTAP tables.",
+                        ErrorCodes::BAD_ARGUMENTS);
+    }
+    if (args.engine_args.size() != 1) {
+        throw Exception("Missing version column. HTAP(ver).", ErrorCodes::BAD_ARGUMENTS);
+    }
+
     StorageFactory::Arguments copy{
-        .engine_name = "VersionedCollapsingMergeTree",
+        .engine_name = "ReplacingMergeTree",
         .engine_args = args.engine_args,
         .storage_def = args.storage_def,
         .query = args.query,
@@ -135,48 +312,64 @@ StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
     };
 
     const auto& storages = StorageFactory::instance().getAllStorages();
-    const auto& creator = storages.at("VersionedCollapsingMergeTree");
-    base_storage = std::dynamic_pointer_cast<StorageMergeTree>(creator.creator_fn(copy));
+    base_storage = (storages.at("ReplacingMergeTree").creator_fn(copy));
 
     setColumns(args.columns);
     setSortingKey(base_storage->getSortingKey());
     setPrimaryKey(base_storage->getPrimaryKey());
 
-    for (const auto& pk_col : base_storage->getPrimaryKeyColumns()) {
-        LOG_INFO(logger, "BASE Primary key column: {}.", pk_col);
-    }
     for (const auto& pk_col : getPrimaryKeyColumns()) {
-        LOG_INFO(logger, "HTAP Primary key column: {}.", pk_col);
+        LOG_INFO(logger, "HTAP Primary key column: '{}'.", pk_col);
     }
+
+    table_size = 0;
 }
 
 Pipes StorageHTAP::read(const Names& column_names,
-                        const SelectQueryInfo&,
-                        const Context&,
-                        QueryProcessingStage::Enum,
-                        size_t,
+                        const SelectQueryInfo& query_info,
+                        const Context& context,
+                        QueryProcessingStage::Enum processed_stage,
+                        size_t max_block_size,
                         unsigned) {
     check(column_names);
 
     std::lock_guard lock(mutex);
 
-    Pipes pipes;
-    pipes.emplace_back(std::make_shared<TableReader>(column_names,
-                                                     table.begin(),
-                                                     table.end(),
-                                                     this));
+    Names column_names_with_pks = getPrimaryKeyColumns();
+    for (const auto& col_name : column_names) {
+        bool pk_col = false;
+        for (const auto& pk_name : getPrimaryKeyColumns()) {
+            if (col_name == pk_name) {
+                pk_col = true;
+                break;
+            }
+        }
+        if (!pk_col) {
+            column_names_with_pks.push_back(col_name);
+        }
+    }
+    Pipes pipes = base_storage->read(column_names_with_pks,
+                                     query_info,
+                                     context,
+                                     processed_stage,
+                                     max_block_size,
+                                     1);
+
+    int* reader_count = new int;
+    *reader_count = pipes.size();
+    for (auto& pipe : pipes) {
+        pipe.addSimpleTransform(std::make_shared<TableReader>(pipe.getHeader(),
+                                                              column_names,
+                                                              reader_count,
+                                                              this));
+    }
+
     return pipes;
 }
 
 BlockOutputStreamPtr StorageHTAP::write(const ASTPtr&,
-                                        const Context&) {
-    Logger* logger = &Logger::get("StorageHTAP");
-
-    for (const auto& pk_col : getPrimaryKeyColumns()) {
-        LOG_INFO(logger, "On write() Primary key column: {}.", pk_col);
-    }
-
-    return std::make_shared<TableWriter>(this);
+                                        const Context& context) {
+    return std::make_shared<TableWriter>(this, context);
 }
 
 bool StorageHTAP::optimize(const DB::ASTPtr& query,
@@ -184,21 +377,35 @@ bool StorageHTAP::optimize(const DB::ASTPtr& query,
                            bool,
                            bool,
                            const DB::Context& context) {
-    base_storage->optimize(query, partition, true, true, context);
+    Logger* logger = &Logger::get("StorageHTAP");
+
+    LOG_INFO(logger, "Optimizing HTAP table '{}'.", getStorageID().getFullTableName());
+    bool ret = base_storage->optimize(query, partition, true, true, context);
+    LOG_INFO(logger, "HTAP table '{}' optimized.", getStorageID().getFullTableName());
+
+    return ret;
 }
 
 void StorageHTAP::drop() {
+    Logger* logger = &Logger::get("StorageHTAP");
+
     std::lock_guard lock(mutex);
+    LOG_INFO(logger, "Dropping HTAP table '{}'.", getStorageID().getFullTableName());
     table.clear();
     base_storage->drop();
+    LOG_INFO(logger, "HTAP table '{}' dropped.", getStorageID().getFullTableName());
 }
 
 void StorageHTAP::truncate(const ASTPtr& astPtr,
                            const Context& context,
                            TableStructureWriteLockHolder& lockHolder) {
+    Logger* logger = &Logger::get("StorageHTAP");
+
     std::lock_guard lock(mutex);
+    LOG_INFO(logger, "Truncating HTAP table '{}'.", getStorageID().getFullTableName());
     table.clear();
     base_storage->truncate(astPtr, context, lockHolder);
+    LOG_INFO(logger, "HTAP table '{}' truncated.", getStorageID().getFullTableName());
 }
 
 std::optional<UInt64> StorageHTAP::totalRows() const {
@@ -210,11 +417,6 @@ static StoragePtr createHTAP(const StorageFactory::Arguments& args) {
     Logger* logger = &Logger::get("StorageHTAP");
 
     LOG_INFO(logger, "Create an HTAP table '{}'.", args.table_id.getFullTableName());
-
-    if (args.storage_def->primary_key == nullptr) {
-        throw Exception("Primary key must be defined for HTAP tables.",
-                        ErrorCodes::STORAGE_REQUIRES_PARAMETER);
-    }
 
     return StorageHTAP::create(args);
 }
