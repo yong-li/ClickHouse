@@ -26,11 +26,11 @@ static Block createOutputHeader(Block header, const Names& column_names) {
     return output_header;
 }
 
-class TableReader : public ISimpleTransform {
+class TableMerger : public ISimpleTransform {
   public:
-    TableReader(const Block& header_,
+    TableMerger(const Block& header_,
                 const Names& column_names_,
-                int* active_reader_count_,
+                std::shared_ptr<int> active_reader_count_,
                 StorageHTAP* storage_)
         : ISimpleTransform(header_, createOutputHeader(header_, column_names_), false),
           column_names{column_names_}, active_reader_count{active_reader_count_},
@@ -64,7 +64,6 @@ class TableReader : public ISimpleTransform {
 
             if (!no_more_data_needed)
                 return Status::PortFull;
-
         }
 
         /// Stop if don't need more data.
@@ -201,9 +200,61 @@ class TableReader : public ISimpleTransform {
 
   private:
     Names column_names;
-    int* active_reader_count;
+    std::shared_ptr<int> active_reader_count;
     StorageHTAP* storage;
     std::set<Tuple> returned_keys;
+};
+
+class TableReader : public SourceWithProgress {
+  public:
+    TableReader(const Names& column_names_, StorageHTAP* storage_)
+        : SourceWithProgress{storage_->getSampleBlockForColumns(column_names_)},
+          column_names{column_names_}, storage(storage_), generated{false} {}
+
+    String getName() const override { return "Table"; }
+
+  protected:
+    Chunk generate() override {
+        if (generated)
+            return {};
+
+        std::lock_guard lock(storage->mutex);
+
+        MutableColumns columns;
+        std::vector<uint32_t> column_positions;
+        columns.reserve(column_names.size());
+        column_positions.reserve(column_names.size());
+
+        for (const std::string& col_name : column_names) {
+            uint32_t pos = 0;
+            for (const auto& col_name_type : storage->getColumns().getAllPhysical()) {
+                if (col_name == col_name_type.name) {
+                    columns.push_back(col_name_type.type->createColumn());
+                    column_positions.push_back(pos);
+                    break;
+                }
+                pos++;
+            }
+        }
+
+        uint32_t row_count = 0;
+        for (const auto& row_pair : storage->table) {
+            const Tuple& row = row_pair.second;
+            for (size_t i = 0; i < columns.size(); i++) {
+                columns[i]->insert(row[column_positions[i]]);
+            }
+            row_count++;
+        }
+
+        generated = true;
+
+        return Chunk(std::move(columns), row_count);
+    }
+
+  private:
+    Names column_names;
+    StorageHTAP* storage;
+    bool generated;
 };
 
 class TableWriter : public IBlockOutputStream {
@@ -331,6 +382,8 @@ Pipes StorageHTAP::read(const Names& column_names,
                         QueryProcessingStage::Enum processed_stage,
                         size_t max_block_size,
                         unsigned) {
+    Logger* logger = &Logger::get("StorageHTAP");
+
     check(column_names);
 
     std::lock_guard lock(mutex);
@@ -355,13 +408,17 @@ Pipes StorageHTAP::read(const Names& column_names,
                                      max_block_size,
                                      1);
 
-    int* reader_count = new int;
-    *reader_count = pipes.size();
-    for (auto& pipe : pipes) {
-        pipe.addSimpleTransform(std::make_shared<TableReader>(pipe.getHeader(),
-                                                              column_names,
-                                                              reader_count,
-                                                              this));
+    auto reader_count = std::make_shared<int>(pipes.size());
+    LOG_INFO(logger, "Read pipe count {}", *reader_count);
+    if (*reader_count == 0) {
+        pipes.emplace_back(std::make_shared<TableReader>(column_names, this));
+    } else {
+        for (auto& pipe : pipes) {
+            pipe.addSimpleTransform(std::make_shared<TableMerger>(pipe.getHeader(),
+                                                                  column_names,
+                                                                  reader_count,
+                                                                  this));
+        }
     }
 
     return pipes;
