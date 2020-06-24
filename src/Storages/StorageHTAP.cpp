@@ -376,6 +376,22 @@ StorageHTAP::StorageHTAP(const StorageFactory::Arguments& args)
     table_size = 0;
 }
 
+void StorageHTAP::startup() {
+    Logger* logger = &Logger::get("StorageHTAP");
+
+    LOG_INFO(logger, "Starting up HTAP table '{}'.", getStorageID().getFullTableName());
+    base_storage->startup();
+    LOG_INFO(logger, "HTAP table '{}' started.", getStorageID().getFullTableName());
+}
+
+void StorageHTAP::shutdown() {
+    Logger* logger = &Logger::get("StorageHTAP");
+
+    LOG_INFO(logger, "Shutting down HTAP table '{}'.", getStorageID().getFullTableName());
+    base_storage->shutdown();
+    LOG_INFO(logger, "HTAP table '{}' shutdown.", getStorageID().getFullTableName());
+}
+
 Pipes StorageHTAP::read(const Names& column_names,
                         const SelectQueryInfo& query_info,
                         const Context& context,
@@ -441,6 +457,14 @@ bool StorageHTAP::optimize(const DB::ASTPtr& query,
     LOG_INFO(logger, "HTAP table '{}' optimized.", getStorageID().getFullTableName());
 
     return ret;
+}
+
+void StorageHTAP::mutate(const MutationCommands& commands, const Context& query_context) {
+    Logger* logger = &Logger::get("StorageHTAP");
+
+    LOG_INFO(logger, "Mutating HTAP table '{}'.", getStorageID().getFullTableName());
+    base_storage->mutate(commands, query_context);
+    LOG_INFO(logger, "HTAP table '{}' mutated.", getStorageID().getFullTableName());
 }
 
 void StorageHTAP::drop() {
